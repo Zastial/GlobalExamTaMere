@@ -77,7 +77,16 @@ async function launchChromeBrowser() {
   return chromium.launch({ channel: "chrome", headless: false });
 }
 
-async function callLLM(prompt) {
+async function callLLM(prompt, imageUrls = []) {
+  const userContent = [{ type: "text", text: prompt }];
+
+  for (const url of imageUrls.slice(0, 6)) {
+    userContent.push({
+      type: "image_url",
+      image_url: { url }
+    });
+  }
+
   const res = await axios.post(
     `${BASE_URL}/chat/completions`,
     {
@@ -88,7 +97,7 @@ async function callLLM(prompt) {
           content:
             "You are an English multiple-choice exam assistant. You must answer directly from provided content and never ask for more information."
         },
-        { role: "user", content: prompt }
+        { role: "user", content: userContent }
       ]
     },
     {
@@ -101,6 +110,57 @@ async function callLLM(prompt) {
   );
 
   return res.data.choices[0].message.content;
+}
+
+async function extractVisibleImageContext(page) {
+  const uniqueUrls = new Set();
+  const descriptions = [];
+
+  for (const frame of page.frames()) {
+    const images = await frame
+      .evaluate(() => {
+        const isVisible = el => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          return rect.width > 20 && rect.height > 20;
+        };
+
+        const compact = s => (s || "").replace(/\s+/g, " ").trim();
+
+        return Array.from(document.querySelectorAll("img"))
+          .filter(isVisible)
+          .slice(0, 25)
+          .map((img, i) => {
+            const src = img.currentSrc || img.src || "";
+            const alt = compact(img.getAttribute("alt") || "");
+            const title = compact(img.getAttribute("title") || "");
+            const nearby = compact(img.closest("figure, .image, #question-content, #question-wrapper")?.innerText || "")
+              .slice(0, 220);
+            return {
+              src,
+              description: `Image ${i + 1}: alt=${alt || "(none)"}; title=${title || "(none)"}; nearby=${nearby || "(none)"}`
+            };
+          })
+          .filter(x => x.src);
+      })
+      .catch(() => []);
+
+    for (const img of images) {
+      if (!uniqueUrls.has(img.src)) {
+        uniqueUrls.add(img.src);
+        descriptions.push(img.description);
+      }
+    }
+  }
+
+  return {
+    imageUrls: Array.from(uniqueUrls),
+    imageSummary: descriptions.slice(0, 10).join("\n")
+  };
 }
 
 async function extractStructuredQuestionContext(page) {
@@ -839,6 +899,7 @@ async function waitForExerciseReady(page) {
     await revealTranscripts(activePage);
     await exploreDocumentTabsAndScroll(activePage);
     const content = await extractExerciseContent(activePage);
+    const { imageUrls, imageSummary } = await extractVisibleImageContext(activePage);
     const structuredQuestions = await extractStructuredQuestionContext(activePage);
     const questionCount = await getRadioQuestionCount(activePage);
     const blankCount = await getBlankFieldCount(activePage);
@@ -872,6 +933,9 @@ async function waitForExerciseReady(page) {
     if (blankCount > 0) {
       console.log(`📝 Champs a completer detectes: ${blankCount}`);
     }
+    if (imageUrls.length > 0) {
+      console.log(`🖼️ Images detectees: ${imageUrls.length}`);
+    }
     console.log("🧠 Envoi au modele...");
 
     const prompt = `
@@ -884,10 +948,14 @@ async function waitForExerciseReady(page) {
   Structured visible questions/options:
   ${structuredQuestions || "(not available)"}
 
+  Image context:
+  ${imageSummary || "(no visible image metadata)"}
+
   Critical rules:
   - Use ONLY the provided context.
   - Do NOT ask for additional information.
   - If evidence is weak, still choose the most likely answer from context clues.
+  - Use images when relevant to infer answers.
   - Prefer grammatical, idiomatic, and context-consistent English.
 
   Reasoning protocol (internal, do not print it):
@@ -911,7 +979,7 @@ async function waitForExerciseReady(page) {
   2: answer
   `;
 
-    const answer = await callLLM(prompt);
+    const answer = await callLLM(prompt, imageUrls);
     lastHandledFingerprint = currentFingerprint;
 
     console.log("\n💡 PROPOSITION:\n");
