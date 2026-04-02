@@ -875,29 +875,41 @@ async function waitForExerciseReady(page) {
     console.log("🧠 Envoi au modele...");
 
     const prompt = `
-You are solving an English exam.
+  You are solving an English exam with high accuracy requirements.
 
-Transcript and page text:
-${content}
+  Context:
+  Transcript and page text:
+  ${content}
 
-Structured visible questions/options:
-${structuredQuestions || "(not available)"}
+  Structured visible questions/options:
+  ${structuredQuestions || "(not available)"}
 
-Task:
-- Use the transcript/page content only
-- Do not ask for more information
-- If there are multiple-choice questions, pick one best option (A/B/C/D) per question
-- If there are blank fields, provide concise fill-in answers
+  Critical rules:
+  - Use ONLY the provided context.
+  - Do NOT ask for additional information.
+  - If evidence is weak, still choose the most likely answer from context clues.
+  - Prefer grammatical, idiomatic, and context-consistent English.
 
-Return strictly in this exact format and nothing else:
-RADIOS:
-1: A
-2: B
+  Reasoning protocol (internal, do not print it):
+  1) First pass: draft answers quickly.
+  2) Second pass: verify each answer against the exact wording and context.
+  3) Third pass: check consistency across all answers, eliminate contradictions, and correct likely distractors.
+  4) Final sanity check: grammar and natural English for blanks.
 
-BLANKS:
-1: answer
-2: answer
-`;
+  Output requirements:
+  - Return ONLY the exact template below.
+  - No explanations, no markdown, no extra text.
+  - For radios, use only A/B/C/D.
+  - For blanks, provide concise final text.
+
+  RADIOS:
+  1: A
+  2: B
+
+  BLANKS:
+  1: answer
+  2: answer
+  `;
 
     const answer = await callLLM(prompt);
     lastHandledFingerprint = currentFingerprint;
