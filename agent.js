@@ -2,23 +2,71 @@ import { chromium } from "playwright";
 import axios from "axios";
 import dotenv from "dotenv";
 import fs from "node:fs";
+import path from "node:path";
 
 dotenv.config();
 
 const API_KEY = process.env.OPENAI_API_KEY;
 const BASE_URL = process.env.OPENAI_BASE_URL;
 const BRAVE_CDP_URL = process.env.BRAVE_CDP_URL || "http://127.0.0.1:9222";
-const BRAVE_APP_PATH = "/Applications/Brave Browser.app";
-const CHROME_APP_PATH = "/Applications/Google Chrome.app";
-const BRAVE_BINARY_PATH = `${BRAVE_APP_PATH}/Contents/MacOS/Brave Browser`;
-const CHROME_BINARY_PATH = `${CHROME_APP_PATH}/Contents/MacOS/Google Chrome`;
+
+// Platform-specific browser paths
+const getPlatformBrowserPaths = () => {
+  const platform = process.platform;
+  
+  if (platform === "darwin") {
+    // macOS paths
+    return {
+      brave: [
+        "/Applications/Brave Browser.app",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+      ],
+      chrome: [
+        "/Applications/Google Chrome.app",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      ]
+    };
+  } else if (platform === "win32") {
+    // Windows paths
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+    const programFilesx86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    return {
+      brave: [
+        path.join(programFiles, "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+        path.join(programFilesx86, "BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+      ],
+      chrome: [
+        path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
+        path.join(programFilesx86, "Google\\Chrome\\Application\\chrome.exe")
+      ]
+    };
+  } else {
+    // Linux and other Unix-like systems
+    return {
+      brave: [
+        "/usr/bin/brave-browser",
+        "/usr/bin/brave",
+        "/snap/bin/brave"
+      ],
+      chrome: [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium"
+      ]
+    };
+  }
+};
+
+const browserPaths = getPlatformBrowserPaths();
 
 function isBraveInstalled() {
-  return fs.existsSync(BRAVE_APP_PATH) || fs.existsSync(BRAVE_BINARY_PATH);
+  return browserPaths.brave.some(p => fs.existsSync(p));
 }
 
 function isChromeInstalled() {
-  return fs.existsSync(CHROME_APP_PATH) || fs.existsSync(CHROME_BINARY_PATH);
+  return browserPaths.chrome.some(p => fs.existsSync(p));
 }
 
 async function launchChromeBrowser() {
@@ -29,7 +77,16 @@ async function launchChromeBrowser() {
   return chromium.launch({ channel: "chrome", headless: false });
 }
 
-async function callLLM(prompt) {
+async function callLLM(prompt, imageUrls = []) {
+  const userContent = [{ type: "text", text: prompt }];
+
+  for (const url of imageUrls.slice(0, 6)) {
+    userContent.push({
+      type: "image_url",
+      image_url: { url }
+    });
+  }
+
   const res = await axios.post(
     `${BASE_URL}/chat/completions`,
     {
@@ -40,7 +97,7 @@ async function callLLM(prompt) {
           content:
             "You are an English multiple-choice exam assistant. You must answer directly from provided content and never ask for more information."
         },
-        { role: "user", content: prompt }
+        { role: "user", content: userContent }
       ]
     },
     {
@@ -53,6 +110,57 @@ async function callLLM(prompt) {
   );
 
   return res.data.choices[0].message.content;
+}
+
+async function extractVisibleImageContext(page) {
+  const uniqueUrls = new Set();
+  const descriptions = [];
+
+  for (const frame of page.frames()) {
+    const images = await frame
+      .evaluate(() => {
+        const isVisible = el => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          return rect.width > 20 && rect.height > 20;
+        };
+
+        const compact = s => (s || "").replace(/\s+/g, " ").trim();
+
+        return Array.from(document.querySelectorAll("img"))
+          .filter(isVisible)
+          .slice(0, 25)
+          .map((img, i) => {
+            const src = img.currentSrc || img.src || "";
+            const alt = compact(img.getAttribute("alt") || "");
+            const title = compact(img.getAttribute("title") || "");
+            const nearby = compact(img.closest("figure, .image, #question-content, #question-wrapper")?.innerText || "")
+              .slice(0, 220);
+            return {
+              src,
+              description: `Image ${i + 1}: alt=${alt || "(none)"}; title=${title || "(none)"}; nearby=${nearby || "(none)"}`
+            };
+          })
+          .filter(x => x.src);
+      })
+      .catch(() => []);
+
+    for (const img of images) {
+      if (!uniqueUrls.has(img.src)) {
+        uniqueUrls.add(img.src);
+        descriptions.push(img.description);
+      }
+    }
+  }
+
+  return {
+    imageUrls: Array.from(uniqueUrls),
+    imageSummary: descriptions.slice(0, 10).join("\n")
+  };
 }
 
 async function extractStructuredQuestionContext(page) {
@@ -791,6 +899,7 @@ async function waitForExerciseReady(page) {
     await revealTranscripts(activePage);
     await exploreDocumentTabsAndScroll(activePage);
     const content = await extractExerciseContent(activePage);
+    const { imageUrls, imageSummary } = await extractVisibleImageContext(activePage);
     const structuredQuestions = await extractStructuredQuestionContext(activePage);
     const questionCount = await getRadioQuestionCount(activePage);
     const blankCount = await getBlankFieldCount(activePage);
@@ -824,34 +933,53 @@ async function waitForExerciseReady(page) {
     if (blankCount > 0) {
       console.log(`📝 Champs a completer detectes: ${blankCount}`);
     }
+    if (imageUrls.length > 0) {
+      console.log(`🖼️ Images detectees: ${imageUrls.length}`);
+    }
     console.log("🧠 Envoi au modele...");
 
     const prompt = `
-You are solving an English exam.
+  You are solving an English exam with high accuracy requirements.
 
-Transcript and page text:
-${content}
+  Context:
+  Transcript and page text:
+  ${content}
 
-Structured visible questions/options:
-${structuredQuestions || "(not available)"}
+  Structured visible questions/options:
+  ${structuredQuestions || "(not available)"}
 
-Task:
-- Use the transcript/page content only
-- Do not ask for more information
-- If there are multiple-choice questions, pick one best option (A/B/C/D) per question
-- If there are blank fields, provide concise fill-in answers
+  Image context:
+  ${imageSummary || "(no visible image metadata)"}
 
-Return strictly in this exact format and nothing else:
-RADIOS:
-1: A
-2: B
+  Critical rules:
+  - Use ONLY the provided context.
+  - Do NOT ask for additional information.
+  - If evidence is weak, still choose the most likely answer from context clues.
+  - Use images when relevant to infer answers.
+  - Prefer grammatical, idiomatic, and context-consistent English.
 
-BLANKS:
-1: answer
-2: answer
-`;
+  Reasoning protocol (internal, do not print it):
+  1) First pass: draft answers quickly.
+  2) Second pass: verify each answer against the exact wording and context.
+  3) Third pass: check consistency across all answers, eliminate contradictions, and correct likely distractors.
+  4) Final sanity check: grammar and natural English for blanks.
 
-    const answer = await callLLM(prompt);
+  Output requirements:
+  - Return ONLY the exact template below.
+  - No explanations, no markdown, no extra text.
+  - For radios, use only A/B/C/D.
+  - For blanks, provide concise final text.
+
+  RADIOS:
+  1: A
+  2: B
+
+  BLANKS:
+  1: answer
+  2: answer
+  `;
+
+    const answer = await callLLM(prompt, imageUrls);
     lastHandledFingerprint = currentFingerprint;
 
     console.log("\n💡 PROPOSITION:\n");
