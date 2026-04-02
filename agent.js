@@ -2,23 +2,71 @@ import { chromium } from "playwright";
 import axios from "axios";
 import dotenv from "dotenv";
 import fs from "node:fs";
+import path from "node:path";
 
 dotenv.config();
 
 const API_KEY = process.env.OPENAI_API_KEY;
 const BASE_URL = process.env.OPENAI_BASE_URL;
 const BRAVE_CDP_URL = process.env.BRAVE_CDP_URL || "http://127.0.0.1:9222";
-const BRAVE_APP_PATH = "/Applications/Brave Browser.app";
-const CHROME_APP_PATH = "/Applications/Google Chrome.app";
-const BRAVE_BINARY_PATH = `${BRAVE_APP_PATH}/Contents/MacOS/Brave Browser`;
-const CHROME_BINARY_PATH = `${CHROME_APP_PATH}/Contents/MacOS/Google Chrome`;
+
+// Platform-specific browser paths
+const getPlatformBrowserPaths = () => {
+  const platform = process.platform;
+  
+  if (platform === "darwin") {
+    // macOS paths
+    return {
+      brave: [
+        "/Applications/Brave Browser.app",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+      ],
+      chrome: [
+        "/Applications/Google Chrome.app",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      ]
+    };
+  } else if (platform === "win32") {
+    // Windows paths
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+    const programFilesx86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    return {
+      brave: [
+        path.join(programFiles, "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+        path.join(programFilesx86, "BraveSoftware\\Brave-Browser\\Application\\brave.exe")
+      ],
+      chrome: [
+        path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
+        path.join(programFilesx86, "Google\\Chrome\\Application\\chrome.exe")
+      ]
+    };
+  } else {
+    // Linux and other Unix-like systems
+    return {
+      brave: [
+        "/usr/bin/brave-browser",
+        "/usr/bin/brave",
+        "/snap/bin/brave"
+      ],
+      chrome: [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium"
+      ]
+    };
+  }
+};
+
+const browserPaths = getPlatformBrowserPaths();
 
 function isBraveInstalled() {
-  return fs.existsSync(BRAVE_APP_PATH) || fs.existsSync(BRAVE_BINARY_PATH);
+  return browserPaths.brave.some(p => fs.existsSync(p));
 }
 
 function isChromeInstalled() {
-  return fs.existsSync(CHROME_APP_PATH) || fs.existsSync(CHROME_BINARY_PATH);
+  return browserPaths.chrome.some(p => fs.existsSync(p));
 }
 
 async function launchChromeBrowser() {
