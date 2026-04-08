@@ -78,38 +78,64 @@ async function launchChromeBrowser() {
 }
 
 async function callLLM(prompt, imageUrls = []) {
+  const safeImageUrls = imageUrls
+    .filter(url => /^https?:\/\//i.test(String(url || "")))
+    .filter(url => !/\.svg(\?|#|$)/i.test(String(url || "")))
+    .slice(0, 6);
+
   const userContent = [{ type: "text", text: prompt }];
 
-  for (const url of imageUrls.slice(0, 6)) {
+  for (const url of safeImageUrls) {
     userContent.push({
       type: "image_url",
       image_url: { url }
     });
   }
 
-  const res = await axios.post(
-    `${BASE_URL}/chat/completions`,
-    {
-      model: process.env.OPENAI_MODEL,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an English multiple-choice exam assistant. You must answer directly from provided content and never ask for more information."
-        },
-        { role: "user", content: userContent }
-      ]
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        "Content-Type": "application/json"
+  const sendRequest = async content => {
+    const res = await axios.post(
+      `${BASE_URL}/chat/completions`,
+      {
+        model: process.env.OPENAI_MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an English multiple-choice exam assistant. You must answer directly from provided content and never ask for more information."
+          },
+          { role: "user", content }
+        ]
       },
-      timeout: 45000
-    }
-  );
+      {
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 45000
+      }
+    );
 
-  return res.data.choices[0].message.content;
+    return res.data.choices[0].message.content;
+  };
+
+  try {
+    return await sendRequest(userContent);
+  } catch (error) {
+    const raw =
+      error?.response?.data?.error?.message ||
+      error?.response?.data?.message ||
+      error?.message ||
+      "";
+    const msg = String(raw || "");
+    const isImageFetchError = /did not return an image|image_url|invalid_image|unsupported image|content-type/i.test(msg);
+
+    if (isImageFetchError && safeImageUrls.length > 0) {
+      console.log("⚠️ Image non compatible detectee (ex: SVG). Nouvelle tentative sans image...");
+      return sendRequest([{ type: "text", text: prompt }]);
+    }
+
+    throw error;
+  }
 }
 
 async function extractVisibleImageContext(page) {
@@ -275,7 +301,55 @@ async function exploreDocumentTabsAndScroll(page) {
 }
 
 function fingerprint(content) {
-  return `${content.length}:${content.slice(0, 220)}`;
+  const normalized = String(content || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "0:";
+
+  const head = normalized.slice(0, 220);
+  const middleStart = Math.max(0, Math.floor(normalized.length / 2) - 110);
+  const middle = normalized.slice(middleStart, middleStart + 220);
+  const tail = normalized.slice(-220);
+
+  return `${normalized.length}:${head}|${middle}|${tail}`;
+}
+
+async function waitForNextActivityPageReady(page, previousFingerprint, options = {}) {
+  const { acceptFinishedState = false } = options;
+  const previousUrl = page.url();
+  const maxWaitMs = 25000;
+  const startAt = Date.now();
+
+  while (Date.now() - startAt < maxWaitMs) {
+    await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
+    await waitForExerciseReady(page);
+
+    const nextVisible = await isNextActivityButtonVisible(page);
+    if (acceptFinishedState && nextVisible) {
+      return { ready: true, reason: "finished", content: "", nextFingerprint: "" };
+    }
+
+    await revealTranscripts(page);
+    await exploreDocumentTabsAndScroll(page);
+
+    const content = await extractExerciseContent(page);
+    const currentUrl = page.url();
+
+    // If URL changed and the page has meaningful content, we can proceed.
+    if (currentUrl !== previousUrl && content && content.length >= 120) {
+      return { ready: true, reason: "next-ready", content, nextFingerprint: fingerprint(content) };
+    }
+
+    if (content && content.length >= 200) {
+      const nextFingerprint = fingerprint(content);
+      if (!previousFingerprint || nextFingerprint !== previousFingerprint) {
+        return { ready: true, reason: "next-ready", content, nextFingerprint };
+      }
+    }
+
+    await page.waitForTimeout(1000);
+  }
+
+  return { ready: false, reason: "timeout", content: "", nextFingerprint: "" };
 }
 
 function parseClockToSeconds(value) {
@@ -411,6 +485,73 @@ function parseBlankAnswers(answerText, blankCount) {
   }
 
   return Array.from({ length: blankCount }, (_, i) => answers[i] || null);
+}
+
+async function extractBlankFieldContext(page) {
+  const chunks = [];
+
+  for (const frame of page.frames()) {
+    const context = await frame
+      .evaluate(() => {
+        const isVisible = el => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+
+        const compact = s => (s || "").replace(/\s+/g, " ").trim();
+        const normalize = s => compact(s).slice(0, 260);
+
+        const fields = Array.from(document.querySelectorAll("input, textarea, [contenteditable='true']")).filter(
+          el => {
+            if (!isVisible(el)) return false;
+            if (el.tagName === "TEXTAREA") return true;
+            if (el.getAttribute("contenteditable") === "true") return true;
+            if (el.tagName === "INPUT") {
+              const type = (el.getAttribute("type") || "text").toLowerCase();
+              return ["text", "search", "email", "tel", "url", "number"].includes(type);
+            }
+            return false;
+          }
+        );
+
+        const getNearbyOptions = field => {
+          const root = field.closest("p, li, label, div, section, article, .question, .exercise, .sentence") || field.parentElement;
+          if (!root) return "";
+
+          const text = compact(root.innerText || root.textContent || "");
+          const optionMatches = text.match(/\b(?:A|B|C|D|1|2|3|4|to\s+[a-z']+|[a-z']+(?:ed|ing|s|ly)?)\b/gi) || [];
+          return compact(optionMatches.slice(0, 16).join(" | "));
+        };
+
+        return fields
+          .slice(0, 20)
+          .map((field, index) => {
+            const placeholder = normalize(field.getAttribute("placeholder") || "");
+            const aria = normalize(field.getAttribute("aria-label") || "");
+            const name = normalize(field.getAttribute("name") || "");
+            const title = normalize(field.getAttribute("title") || "");
+            const nearby = normalize(
+              field.closest("p, li, label, div, section, article, .question, .exercise, .sentence")?.innerText ||
+                field.parentElement?.innerText ||
+                ""
+            );
+            const options = normalize(getNearbyOptions(field));
+
+            return `Blank ${index + 1}: placeholder=${placeholder || "(none)"}; aria=${aria || "(none)"}; name=${name || "(none)"}; title=${title || "(none)"}; nearby=${nearby || "(none)"}; options=${options || "(none)"}`;
+          })
+          .join("\n");
+      })
+      .catch(() => "");
+
+    if (context) chunks.push(context);
+  }
+
+  return chunks.join("\n");
 }
 
 async function normalizeAnswerLettersWithLLM(rawAnswer, questionCount) {
@@ -676,6 +817,51 @@ async function fillBlankAnswers(page, blanks) {
   return filled;
 }
 
+function normalizeBlankAnswerText(value) {
+  return String(value || "")
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatBlankAnswersForModel(blankFieldContext, blankCount) {
+  const lines = String(blankFieldContext || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, blankCount)
+    .map(line => line.replace(/^Blank\s+(\d+):\s*/i, (match, index) => `${index}. `));
+
+  return lines.join("\n");
+}
+
+async function normalizeBlankAnswerWithLLM(blankContext, rawAnswer) {
+  const prompt = `
+You solve fill-in-the-blank English exam items.
+
+For each blank, choose the exact grammatically correct form.
+Rules:
+- Use the sentence context to decide tense, participle, infinitive, plurality, and article.
+- If choices are visible, choose one exact visible option only.
+- Do NOT use a near-synonym or a different verb form when grammar requires a specific one.
+- Pay special attention to auxiliary patterns like would have, had, has, is, was, and to + verb.
+- If the sentence requires a past participle or past form, do not answer with an infinitive.
+- Prefer the form that makes the whole sentence grammatical and natural.
+- Return only the final answers, one per line, with this exact format:
+1: answer
+2: answer
+
+Blank context:
+${blankContext}
+
+Raw answer:
+${rawAnswer}
+`;
+
+  return callLLM(prompt);
+}
+
 async function applyRadioAnswers(page, letters) {
   if (!letters || letters.length === 0) return 0;
 
@@ -777,6 +963,13 @@ async function connectToBrave() {
 
 async function clickProgressButton(page) {
   const selectors = [
+    'button:has-text("Activite suivante")',
+    'button:has-text("Activité suivante")',
+    'button:has-text("Activity suivante")',
+    'button:has-text("Next activity")',
+    'a:has-text("Activite suivante")',
+    'a:has-text("Activité suivante")',
+    'a:has-text("Next activity")',
     'button:has-text("Passer")',
     'button:has-text("Skip")',
     'button:has-text("Validate")',
@@ -793,6 +986,47 @@ async function clickProgressButton(page) {
     const btn = page.locator(selector).first();
     if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
       await btn.click({ timeout: 1500 }).catch(() => {});
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function clickNextActivityButtonIfVisible(page) {
+  const selectors = [
+    'button:has-text("Activite suivante")',
+    'button:has-text("Activité suivante")',
+    'button:has-text("Next activity")',
+    'a:has-text("Activite suivante")',
+    'a:has-text("Activité suivante")',
+    'a:has-text("Next activity")'
+  ];
+
+  for (const selector of selectors) {
+    const btn = page.locator(selector).first();
+    if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+      await btn.click({ timeout: 1500 }).catch(() => {});
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function isNextActivityButtonVisible(page) {
+  const selectors = [
+    'button:has-text("Activite suivante")',
+    'button:has-text("Activité suivante")',
+    'button:has-text("Next activity")',
+    'a:has-text("Activite suivante")',
+    'a:has-text("Activité suivante")',
+    'a:has-text("Next activity")'
+  ];
+
+  for (const selector of selectors) {
+    const btn = page.locator(selector).first();
+    if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
       return true;
     }
   }
@@ -896,15 +1130,73 @@ async function waitForExerciseReady(page) {
 
     await waitForExerciseReady(activePage);
 
+    const clickedNextActivity = await clickNextActivityButtonIfVisible(activePage);
+    if (clickedNextActivity) {
+      console.log("⏳ Bouton Activite suivante detecte, attente du chargement...");
+      const transition = await waitForNextActivityPageReady(activePage, lastHandledFingerprint || "", {
+        acceptFinishedState: false
+      });
+      if (transition.ready) {
+        console.log("✅ Activite suivante chargee. Analyse du nouvel exercice.");
+      } else {
+        console.log("⚠️ Transition detectee mais chargement encore incomplet. Nouvelle verification...");
+      }
+
+      lastHandledFingerprint = "";
+      idleLoopCount = 0;
+      await activePage.waitForTimeout(500);
+      continue;
+    }
+
     await revealTranscripts(activePage);
     await exploreDocumentTabsAndScroll(activePage);
     const content = await extractExerciseContent(activePage);
     const { imageUrls, imageSummary } = await extractVisibleImageContext(activePage);
     const structuredQuestions = await extractStructuredQuestionContext(activePage);
+    const blankFieldContext = await extractBlankFieldContext(activePage);
     const questionCount = await getRadioQuestionCount(activePage);
     const blankCount = await getBlankFieldCount(activePage);
+    const blankContextForModel = formatBlankAnswersForModel(blankFieldContext, blankCount);
+
+    if (questionCount === 0 && blankCount === 0) {
+      console.log("ℹ️ Aucune question active detectee. Tentative de clic sur Activite suivante...");
+      const clickedNoQuestion = await clickProgressButton(activePage);
+
+      if (clickedNoQuestion) {
+        console.log("⏳ Bouton de progression clique, attente du chargement suivant...");
+        const previousFingerprint = content && content.length >= 80 ? fingerprint(content) : "";
+        const transition = await waitForNextActivityPageReady(activePage, previousFingerprint, {
+          acceptFinishedState: false
+        });
+
+        if (transition.ready) {
+          console.log("✅ Activite suivante chargee apres fin d'exercice.");
+          lastHandledFingerprint = "";
+          idleLoopCount = 0;
+          continue;
+        }
+
+        lastHandledFingerprint = "";
+      }
+    }
 
     if (!content || content.length < 200) {
+      const clickedLowContent = await clickProgressButton(activePage);
+      if (clickedLowContent) {
+        console.log("⏳ Contenu faible detecte, progression cliquee. Verification du chargement suivant...");
+        const transition = await waitForNextActivityPageReady(activePage, "", {
+          acceptFinishedState: false
+        });
+        if (transition.ready) {
+          console.log("✅ Activite suivante chargee.");
+          lastHandledFingerprint = "";
+          idleLoopCount = 0;
+          continue;
+        }
+
+        lastHandledFingerprint = "";
+      }
+
       console.log("⚠️ Pas assez de contenu detecte. Ouvre la question visible, puis j'essaie encore...");
       await activePage.waitForTimeout(2500);
       continue;
@@ -917,6 +1209,14 @@ async function waitForExerciseReady(page) {
 
     if (currentFingerprint === lastHandledFingerprint) {
       idleLoopCount += 1;
+      if (idleLoopCount >= 14) {
+        // Safety valve: if we stay too long on an identical snapshot, force one re-analysis.
+        console.log("♻️ Meme contenu detecte trop longtemps, nouvelle tentative d'analyse forcee.");
+        lastHandledFingerprint = "";
+        idleLoopCount = 0;
+        continue;
+      }
+
       if (idleLoopCount % 4 === 0) {
         console.log("⏳ En attente d'un nouvel exercice (ou d'un changement de question)...");
       }
@@ -950,6 +1250,9 @@ async function waitForExerciseReady(page) {
 
   Image context:
   ${imageSummary || "(no visible image metadata)"}
+
+  Blank field context:
+  ${blankContextForModel || "(no visible blank metadata)"}
 
   Critical rules:
   - Use ONLY the provided context.
@@ -1022,13 +1325,22 @@ async function waitForExerciseReady(page) {
       const expectedBlanks = blanks.filter(v => String(v || "").trim().length > 0).length;
 
       if (expectedBlanks > 0) {
-        const filled = await fillBlankAnswers(activePage, blanks);
+        const refinedAnswer = await normalizeBlankAnswerWithLLM(blankContextForModel, answer);
+        const refinedBlanks = parseBlankAnswers(refinedAnswer, blankCount).map(normalizeBlankAnswerText);
+        const preferredBlanks = refinedBlanks.filter(Boolean).length === expectedBlanks ? refinedBlanks : blanks;
+        const filled = await fillBlankAnswers(activePage, preferredBlanks);
         console.log(`✅ Champs remplis automatiquement: ${filled}/${expectedBlanks}`);
         if (filled < expectedBlanks) {
           console.log("⚠️ Tous les champs n'ont pas pu etre remplis. Je ne clique pas sur Passer.");
           await activePage.waitForTimeout(2000);
           continue;
         }
+      }
+
+      if (expectedBlanks === 0) {
+        console.log("⚠️ Format de reponse non reconnu pour les phrases a trou.");
+        await activePage.waitForTimeout(2000);
+        continue;
       }
     }
 
@@ -1042,15 +1354,14 @@ async function waitForExerciseReady(page) {
     let waitReasonLabel = "audio";
     if (audioDurationSec) {
       console.log(`🎧 Duree audio detectee: ${audioDurationSec}s`);
-      waitTargetSec = audioDurationSec;
-      waitReasonLabel = "audio";
+      waitTargetSec = audioDurationSec / 3;
     } else {
       if (!textWaitByFingerprint.has(currentFingerprint)) {
         const randomWaitSec = (process.env.MAX_TEMPS_EXO ? parseInt(process.env.MAX_TEMPS_EXO) : 30) + Math.floor(Math.random() * (process.env.MAX_TEMPS_EXO ? parseInt(process.env.MAX_TEMPS_EXO) : 30));
         textWaitByFingerprint.set(currentFingerprint, randomWaitSec);
       }
 
-      waitTargetSec = textWaitByFingerprint.get(currentFingerprint) || 30;
+      waitTargetSec = textWaitByFingerprint.get(currentFingerprint) || 10;
       waitReasonLabel = "texte";
       console.log(`📖 Exercice texte detecte: attente aleatoire cible ${waitTargetSec}s.`);
     }
@@ -1066,22 +1377,27 @@ async function waitForExerciseReady(page) {
     const clicked = await clickProgressButton(activePage);
     if (!clicked) {
       console.log("ℹ️ Aucun bouton de progression detecte.");
+      await activePage.waitForTimeout(1500);
+      continue;
     }
 
-    let movedToNextExercise = false;
-    for (let i = 0; i < 8; i += 1) {
-      await activePage.waitForTimeout(1000);
-      await revealTranscripts(activePage);
-      const nextContent = await extractExerciseContent(activePage);
-      if (nextContent && nextContent.length >= 200 && fingerprint(nextContent) !== currentFingerprint) {
-        movedToNextExercise = true;
-        break;
+    console.log("⏳ Verification du chargement de l'activite suivante...");
+    const transition = await waitForNextActivityPageReady(activePage, currentFingerprint, {
+      acceptFinishedState: true
+    });
+    if (transition.ready) {
+      if (transition.reason === "finished") {
+        console.log("✅ Exercice termine detecte. Passage a l'activite suivante dans la boucle.");
       }
+      console.log("✅ Activite suivante chargee et prete. Reprise de l'analyse.");
+      lastHandledFingerprint = "";
+      idleLoopCount = 0;
+      continue;
     }
 
-    if (!movedToNextExercise) {
-      console.log("✅ Exo traite. Change d'exercice si besoin, je detecte automatiquement le nouveau.");
-      await activePage.waitForTimeout(2000);
-    }
+    console.log("⚠️ Chargement long ou contenu inchange. Nouvelle verification dans la boucle principale.");
+    lastHandledFingerprint = "";
+    idleLoopCount = 0;
+    await activePage.waitForTimeout(1500);
   }
 })();
